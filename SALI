@@ -33,7 +33,6 @@ for reaction in tqdm(DA):
     reaction.implicify_hydrogens()
     reaction.thiele()
     data.append(reaction)
-del DA
 
 # Поиск растворителя, в котором реакций больше всего
 solvents = [i.meta['additive.1'] for i in data]

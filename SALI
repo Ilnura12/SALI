@@ -1,0 +1,285 @@
+# Необходимые импорты
+import numpy as np
+import random
+import pandas as pd
+import os
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from CGRtools import RDFRead
+from CGRtools.files import RDFwrite
+
+from CIMtools.preprocessing.conditions_container import DictToConditions, ConditionsToDataFrame
+from CIMtools.preprocessing import Fragmentor, CGR, EquationTransformer, SolventVectorizer
+from CIMtools.model_selection import TransformationOut
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.metrics import r2_score, mean_squared_error
+from tqdm import tqdm
+from os import environ
+from collections import Coun
+
+DA = RDFRead('DA_25.04.2017_All.rdf')
+
+# Стандартизация
+data = []
+for reaction in tqdm(DA):
+    reaction.standardize()
+    reaction.kekule()
+    reaction.implicify_hydrogens()
+    reaction.thiele()
+    data.append(reaction)
+del DA
+
+# Поиск растворителя, в котором реакций больше всего
+solvents = [i.meta['additive.1'] for i in data]
+solvent = Counter(solvents)
+solvent.most_common(1)
+
+# Выбор реакций в нужном растворителе
+data_in_toluene = [i for i in data if i.meta['additive.1'] == 'toluene']
+len(data_in_toluene)
+
+del solvents, data
+
+
+# Генерация дескрипторов
+def extract_meta(x):
+    return [y[0].meta for y in x]
+
+
+environ["PATH"] += ":/home/ilnura/cim/fragmentor_lin_2017"
+
+features = ColumnTransformer([('temp', EquationTransformer('1/x'), ['temperature'])])
+conditions = Pipeline([('meta', FunctionTransformer(extract_meta)),
+                       ('cond', DictToConditions(solvents=('additive.1',), temperature='temperature')),
+                       ('desc', ConditionsToDataFrame()),
+                       ('final', features)])
+graph = Pipeline([('CGR', CGR()),
+                  ('frg', Fragmentor(fragment_type=3, max_length=4, useformalcharge=True, version='2017'))])
+pp = ColumnTransformer([('cond', conditions, [0]), ('graph', graph, [0])])
+
+
+# Разбиение на тестовую и обучающую выборки
+def grouper(cgrs, parametrs):
+    groups = []
+    for cgr in cgrs:
+        group = tuple(cgr.meta[parametr] for param in parametrs)
+        groups.append(group)
+    return groups
+
+
+parametrs = []
+groups = grouper(data_in_toluene, parametrs)
+cv_tr = [y for y in TransformationOut(n_splits=5, n_repeats=1, random_state=1,
+                                      shuffle=True).split(X=data_in_toluene, groups=groups)]
+print(cv_tr[0][0].shape, cv_tr[0][1].shape, len(data_in_toluene))
+
+del parametrs, groups
+
+# Создание наборов х и у обучающей и тестовой выборок
+external_test_set = [x for n, x in enumerate(data_in_toluene) if n in cv_tr[0][1]]
+train_test_set = [x for n, x in enumerate(data_in_toluene) if n in cv_tr[0][0]]
+
+y_train = [float(x.meta['logK']) for x in train_test_set]
+y_test = [float(x.meta['logK']) for x in external_test_set]
+
+x_train = pp.fit_transform([[x] for x in train_test_set])
+x_test = pp.transform([[x] for x in external_test_set])
+
+del cv_tr, data_in_toluene
+
+
+# Зашумление части у
+def generating_of_noised_y(y, percent_of_noise):
+    y_train_noised = y.copy()
+    noised_reactions = []
+    frequency_of_noised_points = round((percent_of_noise * len(y)) / 100)
+    for i in random.sample(range(len(y)), frequency_of_noised_points):
+        noised_reactions.append(i)
+        while abs(y[i] - y_train_noised[i]) < 3:
+            y_train_noised[i] = random.uniform(min(y), max(y))
+    return y_train_noised, noised_reactions
+
+
+def random_forest(x, y, x_test, y_test):
+    model = RandomForestRegressor(random_state=1, n_estimators=500, max_features='log2', n_jobs=-1).fit(x, y)
+    y_pred = model.predict(x_test)
+    return r2_score(y_test, y_pred), np.sqrt(mean_squared_error(y_test, y_pred))
+
+
+# Объявление функции расчета Sali
+def sali_calculator(x, y, epsilon=0.00001):
+    scaler = StandardScaler()
+    x = scaler.fit_transform(x)
+    result = []
+    for n, (xi, yi) in enumerate(zip(x, y)):
+        distance = []
+        for i in range(len(x)):
+            dist = np.linalg.norm(x[i] - xi)
+            if dist == 0:
+                continue
+            else:
+                distance.append((i, dist))
+        sali = np.median([abs(yi - y[i]) / (epsilon + x) for i, x in distance])
+        result.append((n, sali))
+    return result
+
+
+def sali_and_dataframe(x, y):
+    x_dataframe = pd.DataFrame(x)
+    x_dataframe['number'] = [i for i in range(len(x))]
+
+    y = np.array(y)
+    y_dataframe = pd.DataFrame(y)
+    y_dataframe.columns = ['y_noised']
+    y_dataframe['number'] = [i for i in range(len(y))]
+
+    sali = sali_calculator(x, y)
+    sali_with_number = []
+    for element in sali:
+        sali_with_number.append(list(element))
+    for element in sali_with_number:
+        element.append(int(y_dataframe.iloc[(element[0])]['number']))
+    sali_sorted_by_value = sorted(sali_with_number, key=lambda x: x[1], reverse=True)
+    return x_dataframe, y_dataframe, sali_sorted_by_value
+
+
+# Удаление зашумленных реакций с самым большим Sali без пересчета
+def without_updating(x, y, x_test, y_test, ideal_or_not, noised_reactions):
+    x_dataframe, y_dataframe, sali_sorted_by_value = sali_and_dataframe(x, y)
+    resultlist1, new_noised_r_w_s = [], []
+    for i, n in enumerate(sali_sorted_by_value):
+        if ideal_or_not == 'ideal':
+            if n[2] in noised_reactions:
+                new_noised_r_w_s.append((n[2], n[1]))
+        else:
+            new_noised_r_w_s.append((n[2], n[1]))
+    while len(resultlist1) < len(noised_reactions):
+        for i, n in enumerate(new_noised_r_w_s[:1]):
+            x_dataframe = x_dataframe.loc[x_dataframe['number'] != n[0]]
+            y_dataframe = y_dataframe.loc[y_dataframe['number'] != n[0]]
+            new_noised_r_w_s.pop(0)
+
+            x_train_new = x_dataframe.iloc[:, 0:x_dataframe.shape[1] - 1].values
+            y_noised_new = y_dataframe['y_noised'].values
+            r2, rmse = random_forest(x_train_new, y_noised_new, x_test, y_test)
+            resultlist1.append((795 - len(y_noised_new), r2, rmse))
+    return resultlist1
+
+
+# Удаление зашумленных реакций с самым большим Sali с пересчетом
+def with_updating(x, y, x_test, y_test, ideal_or_not, noised_reactions):
+    x_dataframe, y_dataframe, sali_sorted_by_value = sali_and_dataframe(x, y)
+    resultlist2 = []
+    while len(resultlist2) < len(noised_reactions):
+        new_noised_r_w_s = []
+        for i, n in enumerate(sali_sorted_by_value):
+            if ideal_or_not == 'ideal':
+                if n[2] in noised_reactions:
+                    new_noised_r_w_s.append((n[2], n[1]))
+            else:
+                new_noised_r_w_s.append((n[2], n[1]))
+        for i, n in enumerate(new_noised_r_w_s[:1]):
+            y_dataframe = y_dataframe.loc[y_dataframe['number'] != n[0]]
+            x_dataframe = x_dataframe.loc[x_dataframe['number'] != n[0]]
+            new_noised_r_w_s.pop(0)
+
+            y_noised_new1 = y_dataframe['y_noised'].values.tolist()
+            x_train_new1 = x_dataframe.iloc[:, 0:x_dataframe.shape[1] - 1].to_numpy()
+
+            x = np.asanyarray(x_train_new1)
+            y = np.asanyarray(y_noised_new1)
+            sali = sali_calculator(x, y)
+            sali_with_number = []
+            for element in sali:
+                sali_with_number.append(list(element))
+            for element in sali_with_number:
+                element.append(int(y_dataframe.iloc[(element[0])]['number']))
+            sali_sorted_by_value = sorted(sali_with_number, key=lambda x: x[1], reverse=True)
+
+            r2, rmse = random_forest(x_train_new1, y_noised_new1, x_test, y_test)
+            resultlist2.append((795 - (len(y_noised_new1)), r2, rmse))
+    return resultlist2
+
+
+def random_delete(x, y, x_test, y_test, noised_reactions):
+    resultlist3, new_noised_r_w_s = [], []
+    x_dataframe, y_dataframe, sali_sorted_by_value = sali_and_dataframe(x, y)
+    while len(resultlist3) < len(noised_reactions):
+        n = random.choice(x_dataframe.index)
+        y_dataframe = y_dataframe.loc[y_dataframe['number'] != n]
+        x_dataframe = x_dataframe.loc[x_dataframe['number'] != n]
+        y_noised_new = y_dataframe['y_noised'].values
+        x_train_new = x_dataframe.iloc[:, 0:x_dataframe.shape[1] - 1].values
+        r2, rmse = random_forest(x_train_new, y_noised_new, x_test, y_test)
+        resultlist3.append((795 - len(y_noised_new), r2, rmse))
+    return resultlist3
+
+
+with_updating_real10 = []
+for f in tqdm(range(0, 10)):
+    y_train_noised, noised_reactions = generating_of_noised_y(y_train, 10)
+    r2, rmse = random_forest(x_train, y_train_noised, x_test, y_test)
+
+    results_ideal_without_updating = with_updating(x_train, y_train_noised, x_test, y_test, 'real', noised_reactions)
+    with_updating_real10.append(results_ideal_without_updating)
+
+y_train_noised, noised_reactions = generating_of_noised_y(y_train, 30)
+r2, rmse = random_forest(x_train, y_train_noised, x_test, y_test)
+
+results_ideal_without_updating = with_updating(x_train, y_train_noised, x_test, y_test, 'real', noised_reactions)
+with_updating_real30.append(results_ideal_without_updating)
+
+
+def graph1(file_with_0, file, with_updating_real, abs_with, abs_without, percent):
+    d = pd.DataFrame(columns=['number', 'r2', 'rmse'])
+    for i in with_updating_real:
+        a = pd.DataFrame(i)
+        a.columns = ['number', 'r2', 'rmse']
+        d = pd.concat([d, a])
+    d = d.groupby('number').median()
+    q = pd.DataFrame(d['r2'])
+
+    q.columns = ['with_updating_real_new']
+    f = pd.read_csv(file_with_0, sep=';')
+    f.columns = ['without_ideal', 'number']
+    f = f.groupby('number').median()
+    l = f.iloc[0]['without_ideal']
+    b = pd.read_csv(file, sep=';')
+    del b['with_real']
+    b.loc[0] = [l, l, l, 0]
+    b = b.groupby('number').median()
+    b['without__ideal'] = f
+    g = pd.read_csv(abs_with, sep=';')
+    g.columns = ['number', 'r2']
+    g = g.groupby('number').median()
+    b['abs_error_with_updating'] = g
+    m = pd.read_csv(abs_without, sep=';')
+    m.columns = ['number', 'r2']
+    m = m.groupby('number').median()
+    b['abs_error_without_updating'] = m
+    b = pd.concat([b, q], 1).reset_index(drop=True)
+
+    b.columns = ['with_updating_Sali_ideal', 'without_updating_Sali_real', 'random', 'without_updating_Sali_ideal',
+                 'abs_error_with_updating', 'abs_error_without_updating', 'with_updating_Sali_real']
+    b.iloc[0, 6] = l
+    r = random_forest(x_train, y_train, x_test, y_test)
+    graph = b.plot().set_title(percent)
+    plt.legend(bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+    y = graph.axes
+    y.axhline(r[0], ls='-', color='black')
+    plt.ylim(top=1)
+    plt.grid()
+    plt.ylabel('r2')
+    plt.xlabel('number_of_deleted_reactions')
+    plt.show()
+
+
+graph1('50% with 0.csv', '50%.csv', with_updating_real50, 'abs_with_50.csv', 'abs_without_50.csv', '50%')
+
